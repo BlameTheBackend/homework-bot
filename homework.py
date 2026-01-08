@@ -2,6 +2,7 @@ import logging
 import os
 import requests
 import time
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telebot import TeleBot
@@ -27,11 +28,12 @@ HOMEWORK_VERDICTS = {
 
 
 def check_tokens():
-    if PRACTICUM_TOKEN and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        return True
-    else:
-        logging.critical('Отсутствуют переменные окружения!')
-        return False
+    variables = {PRACTICUM_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID}
+    missing = [var for var in variables if var is None]
+    if missing:
+        logging.critical(f'{datetime.now()} [CRITICAL]'
+                         + 'Отсутствует одна или несколько обязательных '
+                         + 'переменных окружения!')
 
 
 def send_message(bot, message):

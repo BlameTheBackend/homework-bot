@@ -1,17 +1,31 @@
 import logging
 import os
 import requests
+import sys
 import time
-from datetime import datetime
+from http import HTTPStatus
 
 from dotenv import load_dotenv
-from requests.exceptions import ConnectionError
 from telebot import TeleBot
+
+from exceptions import (
+    MissingKeysException,
+    UnexpectedStatusException,
+    UnsuccessfulResponseException,
+)
 
 
 load_dotenv()
 
-logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.DEBUG)
+stream_handler.setFormatter(
+    logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+)
+
+logger.addHandler(stream_handler)
 
 PRACTICUM_TOKEN: str | None = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN: str | None = os.getenv('TELEGRAM_TOKEN')
@@ -19,13 +33,13 @@ TELEGRAM_CHAT_ID: str | None = os.getenv('TELEGRAM_CHAT_ID')
 
 RETRY_PERIOD: int = 600
 ENDPOINT: str = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
-HEADERS: dict = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
+HEADERS: dict[str, str] = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
 
 
-HOMEWORK_VERDICTS: dict = {
+HOMEWORK_VERDICTS: dict[str, str] = {
     'approved': 'Работа проверена: ревьюеру всё понравилось. Ура!',
     'reviewing': 'Работа взята на проверку ревьюером.',
-    'rejected': 'Работа проверена: у ревьюера есть замечания.'
+    'rejected': 'Работа проверена: у ревьюера есть замечания.',
 }
 
 
@@ -35,16 +49,17 @@ def check_tokens() -> None:
     При отсутствии одной или нескольких переменных - логирует и отправляет
     сообщение пользователю о критической ошибке.
     """
-    variables: dict = {
+    variables: dict[str, str | None] = {
         'PRACTICUM_TOKEN': PRACTICUM_TOKEN,
         'TELEGRAM_TOKEN': TELEGRAM_TOKEN,
         'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID
     }
-    missing: list = [var for var, val in variables.items() if not val]
+    missing: tuple[str, ...] = tuple(
+        var for var, val in variables.items() if not val)
     if missing:
-        logging.critical(f'{datetime.now()} [CRITICAL] '
-                         + 'Отсутствуют обязательные переменные окружения:'
-                         + ', '.join(missing))
+        raise MissingKeysException(
+            f'Отсутствуют переменные окружения: {missing}'
+        )
 
 
 def send_message(bot: TeleBot, message: str) -> None:
@@ -53,17 +68,15 @@ def send_message(bot: TeleBot, message: str) -> None:
     Логирование сообщений с уровнем debug;
     Логирование ошибок с уровнем error и отправление отчета пользователю.
 
-    args:
+    Args:
         bot: Клиент телеграм-бота.
         message: Сообщение для отправки.
     """
     try:
-        bot.send_message(message)
-        logging.debug(f'{datetime.now()} [DEBUG] '
-                      + f'Бот отправил сообщение: "{message}".')
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        logger.debug(f'Бот отправил сообщение: "{message}".')
     except Exception as e:
-        logging.error(f'{datetime.now()} [ERROR] '
-                      + f'При отправке сообщения произошла ошибка: {e}')
+        logger.error(f'При отправке сообщения произошла ошибка: {e}')
 
 
 def get_api_answer(timestamp: int) -> dict:
@@ -73,10 +86,13 @@ def get_api_answer(timestamp: int) -> dict:
 
     Args:
         timestamp: Точка отсчета в виде даты,
-            представленной в формате Unix time.
+            представленной в Unix time формате.
 
     Returns:
-        Возвращает json объект, содержащий ответ эндпоинта.
+        json объект, содержащий ответ эндпоинта.
+
+    Raises:
+        Exception: Сторонняя ошибка, связанная с эндпоинтом.
     """
     try:
         request = requests.get(
@@ -84,64 +100,106 @@ def get_api_answer(timestamp: int) -> dict:
             headers=HEADERS,
             params={'from_date': timestamp}
         )
-    except ConnectionError as e:
-        logging.error(f'{datetime.now()} [ERROR] Произошла ошибка '
-                      + f'при подключении к эндпоинту {ENDPOINT}. '
-                      + f'Код ответа API: {e.response.status_code}')
-    except Exception as e:
-        logging.error(f'{datetime.now()} [ERROR] Произошла сторонняя ошибка, '
-                      + f'связанная с эндпоинтом YandexPracticum: {e}')
+    except requests.RequestException:
+        logger.error('Ошибка соединения с эндпоинтом.')
+    if request.status_code != HTTPStatus.OK:
+        raise UnsuccessfulResponseException('Неуспешный ответ от API.')
     return request.json()
 
 
-def check_response(response) -> bool:
-    """Проверяет ответ API на наличие ожидаемых ключей."""
-    response_json = response.json()
-    if response_json.get('homeworks') and response_json.get('current_date'):
-        return True
-    else:
-        return False
+def check_response(response: dict) -> None:
+    """Проверяет ответ API на наличие ожидаемых ключей.
+
+    Args:
+        response: Ответ API в виде словаря.
+    """
+    if not isinstance(response, dict):
+        raise TypeError('Ответ API не является словарем.')
+    if not isinstance(response.get('homeworks'), list):
+        raise TypeError('Ключ "homeworks" не является списком.')
 
 
-def parse_status(homework):
-    """Возвращает строку со статусом работы (если изменился статус)."""
-    possible_statuses = HOMEWORK_VERDICTS.keys()
-    status = homework.get('status')
-    if status not in possible_statuses:
-        logging.error(f'{datetime.now()} [ERROR] '
-                      + 'Получили неожиданный статус домашней работы.')
-    verdict = HOMEWORK_VERDICTS.get(status)
-    return verdict
+def parse_status(homework: dict) -> str:
+    """Возвращает строку при изменении статуса работы.
+
+    Args:
+        homework: Словарь с информацией о домашней работе.
+
+    Returns:
+        Строку с информацией о статусе работы.
+
+    Raises:
+        MissingKeysException: Отсутствует ключ "homework_name".
+        UnexpectedStatusException: Получен неожиданный статус.
+    """
+    homework_name: str | None = homework.get('homework_name')
+    if not homework_name:
+        raise MissingKeysException('Отсутствует ключ "homework_name".')
+    homework_status: str | None = homework.get('status')
+    if homework_status not in HOMEWORK_VERDICTS:
+        raise UnexpectedStatusException('Получен неожиданный статус.')
+    return (f'Изменился статус проверки работы "{homework_name}". '
+            f'Работа проверена: {HOMEWORK_VERDICTS[homework_status]}')
 
 
-def main():
-    """Основная логика работы бота."""
-    bot = TeleBot(TELEGRAM_TOKEN)
-    if not check_tokens():
+def report_error(bot: TeleBot, prev_message: str | None, message: str) -> None:
+    """Логирует и отправляет сообщение об ошибке.
+
+    Отправляет сообщение только если оно отличается от предыдущего.
+
+    Args:
+        bot: Клиент телеграм-бота.
+        prev_message: Предыдущее сообщение об ошибке.
+        message: Сообщение об ошибке.
+    """
+    logger.error(message)
+    if prev_message != message:
+        send_message(bot, message)
+
+
+def main() -> None:
+    """Основная логика работы бота.
+
+    Содержит бесконечный цикл, прерывающийся при получении исключения.
+    """
+    bot: TeleBot = TeleBot(TELEGRAM_TOKEN)
+    try:
+        check_tokens()
+    except MissingKeysException as e:
+        logger.critical(e)
+        send_message(bot, str(e))
         return
-    timestamp = int(time.time())
-    current_status = None
-    error_sent = False
+
+    timestamp: int = int(time.time())
+    prev_error_message: str | None = None
+    last_status: str | None = None
 
     while True:
         try:
             response = get_api_answer(timestamp)
-            if not check_response(response):
-                return
-            previous_status = current_status
-            homework = response[0].get('homeworks')[-1]
-            current_status = parse_status(homework)
-            if previous_status != current_status:
-                send_message(bot, HOMEWORK_VERDICTS.get(current_status))
-            else:
-                logging.debug('Отсутствуют изменения в статусе работы.')
-            bot.polling(interval=RETRY_PERIOD)
-            time.sleep(RETRY_PERIOD)
+            check_response(response)
 
-        except Exception as error:
-            message = f'Сбой в работе программы: {error}'
-            if not error_sent:
+            homeworks = response.get('homeworks')
+            if not homeworks:
+                logger.debug('Список домашних работ пуст.')
+                time.sleep(RETRY_PERIOD)
+                continue
+
+            homework = homeworks[-1]
+            current_status = homework.get('status')
+            if current_status != last_status:
+                message = parse_status(homework)
                 send_message(bot, message)
+                last_status = current_status
+            else:
+                logger.debug('Отсутствуют изменения в статусе работы.')
+
+            parse_status(homework)
+            time.sleep(RETRY_PERIOD)
+        except Exception as error:
+            report_error(bot, prev_error_message, str(error))
+            prev_error_message = str(error)
+            return
 
 
 if __name__ == '__main__':

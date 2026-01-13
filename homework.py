@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import requests
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 from telebot import TeleBot
 
 from exceptions import (
+    InvalidJSONException,
+    InvalidResponseException,
     MissingKeysException,
     UnexpectedStatusException,
     UnsuccessfulResponseException,
@@ -92,7 +95,9 @@ def get_api_answer(timestamp: int) -> dict:
         json объект, содержащий ответ эндпоинта.
 
     Raises:
-        Exception: Сторонняя ошибка, связанная с эндпоинтом.
+        ConnectionError: Ошибка соединения с эндпоинтом.
+        InvalidJSONException: Ответ API не в формате JSON.
+        UnsuccessfulResponseException: Неуспешный ответ от API.
     """
     try:
         request = requests.get(
@@ -100,11 +105,13 @@ def get_api_answer(timestamp: int) -> dict:
             headers=HEADERS,
             params={'from_date': timestamp}
         )
+        if request.status_code != HTTPStatus.OK:
+            raise UnsuccessfulResponseException('Неуспешный ответ от API.')
+        return request.json()
     except requests.RequestException:
-        logger.error('Ошибка соединения с эндпоинтом.')
-    if request.status_code != HTTPStatus.OK:
-        raise UnsuccessfulResponseException('Неуспешный ответ от API.')
-    return request.json()
+        raise ConnectionError('Ошибка соединения с эндпоинтом.')
+    except json.JSONDecodeError:
+        raise InvalidJSONException('Ответ API не в формате JSON.')
 
 
 def check_response(response: dict) -> None:
@@ -112,11 +119,15 @@ def check_response(response: dict) -> None:
 
     Args:
         response: Ответ API в виде словаря.
+
+    Raises:
+        InvalidResponseException: Ответ API не является словарем
+            или ключ "homeworks" не является списком.
     """
     if not isinstance(response, dict):
-        raise TypeError('Ответ API не является словарем.')
+        raise InvalidResponseException('Ответ API не является словарем.')
     if not isinstance(response.get('homeworks'), list):
-        raise TypeError('Ключ "homeworks" не является списком.')
+        raise InvalidResponseException('Ключ "homeworks" не является списком.')
 
 
 def parse_status(homework: dict) -> str:
@@ -178,6 +189,7 @@ def main() -> None:
         try:
             response = get_api_answer(timestamp)
             check_response(response)
+            timestamp = response.get('current_date', timestamp)
 
             homeworks = response.get('homeworks')
             if not homeworks:
